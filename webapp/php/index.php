@@ -187,6 +187,17 @@ function image_url($post) {
     return "/image/{$post['id']}{$ext}";
 }
 
+function ext_for_mime($mime) {
+    if ($mime === 'image/jpeg') return 'jpg';
+    if ($mime === 'image/png')  return 'png';
+    if ($mime === 'image/gif')  return 'gif';
+    return '';
+}
+
+function image_file_path($id, $ext) {
+    return dirname(__DIR__) . "/public/image/{$id}.{$ext}";
+}
+
 function validate_user($account_name, $password) {
     if (!(preg_match('/\A[0-9a-zA-Z_]{3,}\z/', $account_name) && preg_match('/\A[0-9a-zA-Z_]{6,}\z/', $password))) {
         return false;
@@ -377,16 +388,24 @@ $app->post('/', function (Request $request, Response $response) {
             return redirect($response, '/', 302);
         }
 
+        $imgdata = file_get_contents($_FILES['file']['tmp_name']);
         $db = $this->get('db');
         $query = 'INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)';
         $ps = $db->prepare($query);
         $ps->execute([
           $me['id'],
           $mime,
-          file_get_contents($_FILES['file']['tmp_name']),
+          $imgdata,
           $params['body'],
         ]);
         $pid = $db->lastInsertId();
+
+        // nginxが静的配信できるようにファイルとしても書き出す
+        $ext = ext_for_mime($mime);
+        if ($ext !== '') {
+            file_put_contents(image_file_path($pid, $ext), $imgdata);
+        }
+
         return redirect($response, "/posts/{$pid}", 302);
     } else {
         $this->get('flash')->addMessage('notice', '画像が必須です');
@@ -404,6 +423,8 @@ $app->get('/image/{id}.{ext}', function (Request $request, Response $response, $
     if (($args['ext'] == 'jpg' && $post['mime'] == 'image/jpeg') ||
         ($args['ext'] == 'png' && $post['mime'] == 'image/png') ||
         ($args['ext'] == 'gif' && $post['mime'] == 'image/gif')) {
+        // 初回アクセス時にファイルへ書き出し、次回以降はnginxが静的配信する
+        file_put_contents(image_file_path($args['id'], $args['ext']), $post['imgdata']);
         $response->getBody()->write($post['imgdata']);
         return $response->withHeader('Content-Type', $post['mime']);
     }
