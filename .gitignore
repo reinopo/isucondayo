@@ -1,0 +1,13 @@
+# 生成物・巨大ファイル（コミットしない）
+webapp/public/image/
+benchmarker/userdata/
+webapp/php/vendor/
+
+# バックアップ・ログ
+*.bak
+*.bak.*
+index.php.bak.*
+*.log
+
+# OS
+.DS_Store
