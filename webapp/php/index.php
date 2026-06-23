@@ -457,18 +457,28 @@ $app->get('/posts', function (Request $request, Response $response) {
 });
 
 $app->get('/posts/{id}', function (Request $request, Response $response, $args) {
-    $db = $this->get('db');
-    $ps = $db->prepare('SELECT * FROM `posts` WHERE `id` = ?');
-    $ps->execute([$args['id']]);
-    $results = $ps->fetchAll(PDO::FETCH_ASSOC);
-    $posts = $this->get('helper')->make_posts($results, ['all_comments' => true]);
+    $id = (int)$args['id'];
+    $mc = $this->get('memcached');
+    $cacheKey = 'post:' . $id;
 
-    if (count($posts) == 0) {
-        $response->getBody()->write('404');
-        return $response->withStatus(404);
+    // 投稿データ（コメント込み）をキャッシュ。POST /comment と POST /admin/banned で
+    // 無効化し、initialize で flush するので整合性は保たれる。TTLは保険として短め。
+    $post = $mc->get($cacheKey);
+    if ($post === false) {
+        $db = $this->get('db');
+        // imgdata はページ表示に不要なので引かない（seed画像のBLOB転送を回避）
+        $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?');
+        $ps->execute([$id]);
+        $results = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $posts = $this->get('helper')->make_posts($results, ['all_comments' => true]);
+
+        if (count($posts) == 0) {
+            $response->getBody()->write('404');
+            return $response->withStatus(404);
+        }
+        $post = $posts[0];
+        $mc->set($cacheKey, $post, 10);
     }
-
-    $post = $posts[0];
 
     $me = $this->get('helper')->get_session_user();
 
@@ -583,8 +593,10 @@ $app->post('/comment', function (Request $request, Response $response) {
         $params['comment']
     ]);
 
-    // コメント数キャッシュを無効化（次回 make_posts で再集計）
-    $this->get('memcached')->delete("cc:" . (int)$post_id);
+    // コメント数キャッシュと投稿ページキャッシュを無効化（コメント追加を即反映）
+    $mc = $this->get('memcached');
+    $mc->delete("cc:" . (int)$post_id);
+    $mc->delete("post:" . (int)$post_id);
 
     return redirect($response, "/posts/{$post_id}", 302);
 });
@@ -633,6 +645,9 @@ $app->post('/admin/banned', function (Request $request, Response $response) {
         $ps = $db->prepare($query);
         $ps->execute([1, $id]);
     }
+
+    // BANで投稿の表示可否(404化)が変わるため、投稿ページ等のキャッシュを全消し（BANは稀）
+    $this->get('memcached')->flush();
 
     return redirect($response, '/admin/banned', 302);
 });
