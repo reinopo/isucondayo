@@ -1,2 +1,3 @@
 [mysqld]
 innodb_buffer_pool_size = 1G
+innodb_flush_log_at_trx_commit = 2
