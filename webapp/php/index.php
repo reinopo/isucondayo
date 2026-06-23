@@ -59,6 +59,17 @@ $container->set('db', function ($c) {
     );
 });
 
+$container->set('memcached', function () use ($memd_addr) {
+    // persistent_id でワーカー内のコネクションを使い回す
+    $mc = new Memcached('isuconp_pool');
+    if (count($mc->getServerList()) === 0) {
+        $parts = explode(':', $memd_addr);
+        $mc->addServer($parts[0], (int)($parts[1] ?? 11211));
+        $mc->setOption(Memcached::OPT_BINARY_PROTOCOL, true);
+    }
+    return $mc;
+});
+
 $container->set('view', function ($c) {
     return new class(__DIR__ . '/views/') extends \Slim\Views\PhpRenderer {
         public function render(\Psr\Http\Message\ResponseInterface $response, string $template, array $data = []): ResponseInterface {
@@ -75,9 +86,11 @@ $container->set('flash', function () {
 $container->set('helper', function ($c) {
     return new class($c) {
         public PDO $db;
+        public $mc;
 
         public function __construct($c) {
             $this->db = $c->get('db');
+            $this->mc = $c->get('memcached');
         }
 
         public function db() {
@@ -99,10 +112,14 @@ $container->set('helper', function ($c) {
             // id > 10000 の投稿はDBから削除されるので、対応する画像ファイルも消す（ディスクリーク防止）
             $image_dir = dirname(__DIR__) . '/public/image';
             foreach (glob($image_dir . '/*') as $f) {
-                if ((int)basename($f) > 10000) {
+                $base = basename($f);
+                if ((int)$base > 10000 || strpos($base, '.tmp') !== false) {
                     @unlink($f);
                 }
             }
+
+            // データがリセットされるのでキャッシュも全消去
+            $this->mc->flush();
         }
 
         public function fetch_first($query, ...$params) {
@@ -187,12 +204,35 @@ $container->set('helper', function ($c) {
             $post_ids = array_column($selected, 'id');
             $placeholder = implode(',', array_fill(0, count($post_ids), '?'));
 
-            // コメント件数を一括集計
+            // コメント件数（cc:{post_id}）をキャッシュ。POST /comment で invalidate、initialize で flush
             $counts = [];
-            $ps = $this->db()->prepare("SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN ($placeholder) GROUP BY `post_id`");
-            $ps->execute($post_ids);
-            foreach ($ps->fetchAll(PDO::FETCH_ASSOC) as $row) {
-                $counts[$row['post_id']] = (int)$row['count'];
+            $ccKeys = [];
+            foreach ($post_ids as $pid) {
+                $ccKeys[] = "cc:" . (int)$pid;
+            }
+            $ccCached = $this->mc->getMulti($ccKeys) ?: [];
+            $missing = [];
+            foreach ($post_ids as $pid) {
+                $k = "cc:" . (int)$pid;
+                if (isset($ccCached[$k])) {
+                    $counts[$pid] = (int)$ccCached[$k];
+                } else {
+                    $missing[] = $pid;
+                }
+            }
+            if (!empty($missing)) {
+                $ph = implode(',', array_fill(0, count($missing), '?'));
+                $ps = $this->db()->prepare("SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN ($ph) GROUP BY `post_id`");
+                $ps->execute($missing);
+                $found = [];
+                foreach ($ps->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                    $found[$row['post_id']] = (int)$row['count'];
+                }
+                foreach ($missing as $pid) {
+                    $cnt = $found[$pid] ?? 0; // コメント0件のpostも0をキャッシュ
+                    $counts[$pid] = $cnt;
+                    $this->mc->set("cc:" . (int)$pid, $cnt, 3600);
+                }
             }
 
             // コメント本体を一括取得（post_id ごとに created_at DESC で並ぶ）
@@ -265,6 +305,17 @@ function ext_for_mime($mime) {
 
 function image_file_path($id, $ext) {
     return dirname(__DIR__) . "/public/image/{$id}.{$ext}";
+}
+
+// 一時ファイルに書いてから rename でアトミック置換する。
+// （高負荷時に nginx が書き込み途中のファイルを配信して fail するのを防ぐ）
+function atomic_write_image($path, $data) {
+    $tmp = $path . '.tmp' . getmypid();
+    if (file_put_contents($tmp, $data) !== false) {
+        rename($tmp, $path); // 同一ファイルシステム内なら rename はアトミック
+    } else {
+        @unlink($tmp);
+    }
 }
 
 function validate_user($account_name, $password) {
@@ -471,7 +522,7 @@ $app->post('/', function (Request $request, Response $response) {
         // nginxが静的配信できるようにファイルとしても書き出す
         $ext = ext_for_mime($mime);
         if ($ext !== '') {
-            file_put_contents(image_file_path($pid, $ext), $imgdata);
+            atomic_write_image(image_file_path($pid, $ext), $imgdata);
         }
 
         return redirect($response, "/posts/{$pid}", 302);
@@ -492,7 +543,7 @@ $app->get('/image/{id}.{ext}', function (Request $request, Response $response, $
         ($args['ext'] == 'png' && $post['mime'] == 'image/png') ||
         ($args['ext'] == 'gif' && $post['mime'] == 'image/gif')) {
         // 初回アクセス時にファイルへ書き出し、次回以降はnginxが静的配信する
-        file_put_contents(image_file_path($args['id'], $args['ext']), $post['imgdata']);
+        atomic_write_image(image_file_path($args['id'], $args['ext']), $post['imgdata']);
         $response->getBody()->write($post['imgdata']);
         return $response->withHeader('Content-Type', $post['mime']);
     }
@@ -526,6 +577,9 @@ $app->post('/comment', function (Request $request, Response $response) {
         $me['id'],
         $params['comment']
     ]);
+
+    // コメント数キャッシュを無効化（次回 make_posts で再集計）
+    $this->get('memcached')->delete("cc:" . (int)$post_id);
 
     return redirect($response, "/posts/{$post_id}", 302);
 });
