@@ -127,34 +127,95 @@ $container->set('helper', function ($c) {
             return $user ?: null;
         }
 
+        public function fetch_users_by_ids(array $ids) {
+            $ids = array_values(array_unique($ids));
+            if (empty($ids)) {
+                return [];
+            }
+            $placeholder = implode(',', array_fill(0, count($ids), '?'));
+            $ps = $this->db()->prepare("SELECT * FROM `users` WHERE `id` IN ($placeholder)");
+            $ps->execute($ids);
+            $map = [];
+            foreach ($ps->fetchAll(PDO::FETCH_ASSOC) as $u) {
+                $map[$u['id']] = $u;
+            }
+            return $map;
+        }
+
         public function make_posts(array $results, $options = []) {
             $options += ['all_comments' => false];
             $all_comments = $options['all_comments'];
 
-            $posts = [];
-            foreach ($results as $post) {
-                $post['comment_count'] = $this->fetch_first('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', $post['id'])['count'];
-                $query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC';
-                if (!$all_comments) {
-                    $query .= ' LIMIT 3';
-                }
+            if (empty($results)) {
+                return [];
+            }
 
-                $ps = $this->db()->prepare($query);
-                $ps->execute([$post['id']]);
-                $comments = $ps->fetchAll(PDO::FETCH_ASSOC);
+            // 投稿者の del_flg を見て表示対象を POSTS_PER_PAGE 件まで絞る。
+            // results は最大1万件来るので、必要な分だけバッチでユーザーを引く
+            $selected = [];
+            $total = count($results);
+            $offset = 0;
+            $batch = max(POSTS_PER_PAGE * 2, 40);
+            while (count($selected) < POSTS_PER_PAGE && $offset < $total) {
+                $slice = array_slice($results, $offset, $batch);
+                $offset += $batch;
+                $users = $this->fetch_users_by_ids(array_column($slice, 'user_id'));
+                foreach ($slice as $post) {
+                    $user = $users[$post['user_id']] ?? null;
+                    if ($user === null || $user['del_flg'] != 0) {
+                        continue;
+                    }
+                    $post['user'] = $user;
+                    $selected[] = $post;
+                    if (count($selected) >= POSTS_PER_PAGE) {
+                        break;
+                    }
+                }
+            }
+            if (empty($selected)) {
+                return [];
+            }
+
+            $post_ids = array_column($selected, 'id');
+            $placeholder = implode(',', array_fill(0, count($post_ids), '?'));
+
+            // コメント件数を一括集計
+            $counts = [];
+            $ps = $this->db()->prepare("SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN ($placeholder) GROUP BY `post_id`");
+            $ps->execute($post_ids);
+            foreach ($ps->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                $counts[$row['post_id']] = (int)$row['count'];
+            }
+
+            // コメント本体を一括取得（post_id ごとに created_at DESC で並ぶ）
+            $ps = $this->db()->prepare("SELECT * FROM `comments` WHERE `post_id` IN ($placeholder) ORDER BY `post_id`, `created_at` DESC");
+            $ps->execute($post_ids);
+            $comments_by_post = [];
+            $comment_user_ids = [];
+            foreach ($ps->fetchAll(PDO::FETCH_ASSOC) as $comment) {
+                $pid = $comment['post_id'];
+                // all_comments でなければ各 post の最新3件のみ
+                if (!$all_comments && isset($comments_by_post[$pid]) && count($comments_by_post[$pid]) >= 3) {
+                    continue;
+                }
+                $comments_by_post[$pid][] = $comment;
+                $comment_user_ids[] = $comment['user_id'];
+            }
+
+            // コメント投稿者を一括取得
+            $comment_users = $this->fetch_users_by_ids($comment_user_ids);
+
+            $posts = [];
+            foreach ($selected as $post) {
+                $pid = $post['id'];
+                $post['comment_count'] = $counts[$pid] ?? 0;
+                $comments = $comments_by_post[$pid] ?? [];
                 foreach ($comments as &$comment) {
-                    $comment['user'] = $this->fetch_first('SELECT * FROM `users` WHERE `id` = ?', $comment['user_id']);
+                    $comment['user'] = $comment_users[$comment['user_id']] ?? null;
                 }
                 unset($comment);
                 $post['comments'] = array_reverse($comments);
-
-                $post['user'] = $this->fetch_first('SELECT * FROM `users` WHERE `id` = ?', $post['user_id']);
-                if ($post['user']['del_flg'] == 0) {
-                    $posts[] = $post;
-                }
-                if (count($posts) >= POSTS_PER_PAGE) {
-                    break;
-                }
+                $posts[] = $post;
             }
             return $posts;
         }
