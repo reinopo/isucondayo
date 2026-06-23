@@ -430,12 +430,20 @@ $app->get('/logout', function (Request $request, Response $response) {
 
 $app->get('/', function (Request $request, Response $response) {
     $me = $this->get('helper')->get_session_user();
+    $mc = $this->get('memcached');
 
-    $db = $this->get('db');
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT 100');
-    $ps->execute();
-    $results = $ps->fetchAll(PDO::FETCH_ASSOC);
-    $posts = $this->get('helper')->make_posts($results);
+    // トップの投稿一覧（先頭20件＋各コメント3件）をキャッシュ。
+    // POST /（新規投稿）・POST /comment で無効化、POST /admin/banned と initialize で flush。
+    // ログイン状態/CSRF/flashはユーザー毎なのでHTMLはキャッシュせず、データ($posts)のみ。
+    $posts = $mc->get('index:top');
+    if ($posts === false) {
+        $db = $this->get('db');
+        $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT 100');
+        $ps->execute();
+        $results = $ps->fetchAll(PDO::FETCH_ASSOC);
+        $posts = $this->get('helper')->make_posts($results);
+        $mc->set('index:top', $posts, 10);
+    }
 
     return $this->get('view')->render($response, 'index.php', [
         'posts' => $posts,
@@ -537,6 +545,9 @@ $app->post('/', function (Request $request, Response $response) {
             atomic_write_image(image_file_path($pid, $ext), $imgdata);
         }
 
+        // 新規投稿はトップ一覧の先頭に来るのでトップキャッシュを無効化
+        $this->get('memcached')->delete('index:top');
+
         return redirect($response, "/posts/{$pid}", 302);
     } else {
         $this->get('flash')->addMessage('notice', '画像が必須です');
@@ -593,10 +604,12 @@ $app->post('/comment', function (Request $request, Response $response) {
         $params['comment']
     ]);
 
-    // コメント数キャッシュと投稿ページキャッシュを無効化（コメント追加を即反映）
+    // コメント数・投稿ページ・トップ一覧キャッシュを無効化（コメント追加を即反映）
+    // トップは各投稿の最新3コメントを表示するため、コメント追加で無効化が必要。
     $mc = $this->get('memcached');
     $mc->delete("cc:" . (int)$post_id);
     $mc->delete("post:" . (int)$post_id);
+    $mc->delete('index:top');
 
     return redirect($response, "/posts/{$post_id}", 302);
 });
