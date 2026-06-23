@@ -509,17 +509,19 @@ $app->post('/', function (Request $request, Response $response) {
 
         $imgdata = file_get_contents($_FILES['file']['tmp_name']);
         $db = $this->get('db');
+        // imgdata はDBに保存しない（空文字）。画像はディスク上のファイルとして保持し
+        // nginx が静的配信する。DBへのBLOB二重保存をやめて書き込み負荷とディスク消費を削減。
         $query = 'INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)';
         $ps = $db->prepare($query);
         $ps->execute([
           $me['id'],
           $mime,
-          $imgdata,
+          '',
           $params['body'],
         ]);
         $pid = $db->lastInsertId();
 
-        // nginxが静的配信できるようにファイルとしても書き出す
+        // DBにimgdataが無いので、ファイル書き出しは必須（アトミック書き込み）
         $ext = ext_for_mime($mime);
         if ($ext !== '') {
             atomic_write_image(image_file_path($pid, $ext), $imgdata);
@@ -539,10 +541,13 @@ $app->get('/image/{id}.{ext}', function (Request $request, Response $response, $
 
     $post = $this->get('helper')->fetch_first('SELECT * FROM `posts` WHERE `id` = ?', $args['id']);
 
-    if (($args['ext'] == 'jpg' && $post['mime'] == 'image/jpeg') ||
-        ($args['ext'] == 'png' && $post['mime'] == 'image/png') ||
-        ($args['ext'] == 'gif' && $post['mime'] == 'image/gif')) {
-        // 初回アクセス時にファイルへ書き出し、次回以降はnginxが静的配信する
+    if ((($args['ext'] == 'jpg' && $post['mime'] == 'image/jpeg') ||
+         ($args['ext'] == 'png' && $post['mime'] == 'image/png') ||
+         ($args['ext'] == 'gif' && $post['mime'] == 'image/gif'))
+        && $post['imgdata'] !== '') {
+        // DBにimgdataがある（シード画像）場合のみ、初回アクセスでファイル書き出し＋配信。
+        // 新規投稿は imgdata が空でディスクのファイルが正なので、ここで空ファイルを作らない
+        // （作るとnginxが空画像を永続配信して破壊するため）。
         atomic_write_image(image_file_path($args['id'], $args['ext']), $post['imgdata']);
         $response->getBody()->write($post['imgdata']);
         return $response->withHeader('Content-Type', $post['mime']);
